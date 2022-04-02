@@ -16,6 +16,19 @@ proc setupServer*(srv: RpcServer) =
   srv.rpc("invalidRequest") do():
     raise (ref InvalidRequest)(code: -32001, msg: "Unknown payload")
 
+proc setupServerExposed*(srv: RpcServer) =
+  srv.erpc("myProc") do(input: string, data: array[0..3, int]):
+    if not ws.isNil:
+      return %("Hello " & input & " data: " & $data)
+
+  srv.erpc("myError") do(input: string, data: array[0..3, int]):
+    if not ws.isNil:
+      raise (ref ValueError)(msg: "someMessage")
+
+  srv.erpc("invalidRequest") do():
+    if not ws.isNil:
+      raise (ref InvalidRequest)(code: -32001, msg: "Unknown payload")
+
 suite "Socket Server/Client RPC":
   var srv = newRpcSocketServer(["localhost:8545"])
   var client = newRpcSocketClient()
@@ -82,6 +95,38 @@ suite "Websocket Server/Client RPC with Compression":
   var client = newRpcWebSocketClient()
 
   srv.setupServer()
+  srv.start()
+  waitFor client.connect("ws://127.0.0.1:8545/",
+                         compression = compressionSupported)
+
+  test "Successful RPC call":
+    let r = waitFor client.call("myProc", %[%"abc", %[1, 2, 3, 4]])
+    check r.getStr == "Hello abc data: [1, 2, 3, 4]"
+
+  test "Missing params":
+    expect(CatchableError):
+      discard waitFor client.call("myProc", %[%"abc"])
+
+  test "Error RPC call":
+    expect(CatchableError): # The error type wont be translated
+      discard waitFor client.call("myError", %[%"abc", %[1, 2, 3, 4]])
+
+  test "Invalid request exception":
+    try:
+      discard waitFor client.call("invalidRequest", %[])
+      check false
+    except CatchableError as e:
+      check e.msg == """{"code":-32001,"message":"Unknown payload","data":null}"""
+
+  srv.stop()
+  waitFor srv.closeWait()
+
+suite "Websocket Server/Client RPC with Exposed WebSession":
+  var srv = newRpcWebSocketServer("127.0.0.1", Port(8545),
+                                  compression = compressionSupported,
+                                  exposed = true)
+  var client = newRpcWebSocketClient()
+  srv.setupServerExposed()
   srv.start()
   waitFor client.connect("ws://127.0.0.1:8545/",
                          compression = compressionSupported)

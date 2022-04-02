@@ -4,7 +4,7 @@ import
   ../json_rpc/clients/config
 
 import
-  testrpcmacro, testethcalls, testhttp, testserverclient
+  testrpcmacro, testerpcmacro, testethcalls, testhttp, testserverclient
 
 when not useNews:
   # The proxy implementation is based on websock

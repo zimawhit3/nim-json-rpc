@@ -2,7 +2,7 @@ import
   chronicles, httputils, chronos, websock/websock,
   websock/extensions/compression/deflate,
   stew/byteutils, json_serialization/std/net,
-  ".."/[errors, server]
+  ".."/server
 
 export server, net
 
@@ -14,7 +14,7 @@ type
     server: StreamServer
     wsserver: WSServer
 
-proc handleRequest(rpc: RpcWebSocketServer, request: HttpRequest) {.async.} =
+proc handleRequest(rpc: RpcWebSocketServer, request: HttpRequest, exposed: bool) {.async.} =
   trace "Handling request:", uri = request.uri.path
   trace "Initiating web socket connection."
   try:
@@ -39,8 +39,12 @@ proc handleRequest(rpc: RpcWebSocketServer, request: HttpRequest) {.async.} =
           reason = "cannot process zero length message"
         )
         break
-
-      let future = rpc.route(string.fromBytes(recvData))
+      
+      var future : Future[string]
+      if exposed:
+        future = rpc.route(ws, string.fromBytes(recvData))
+      else:
+        future = rpc.route(string.fromBytes(recvData))
       yield future
       if future.failed:
         debug "Internal error, while processing RPC call",
@@ -58,6 +62,11 @@ proc handleRequest(rpc: RpcWebSocketServer, request: HttpRequest) {.async.} =
   except WebSocketError as exc:
     error "WebSocket error:", exception = exc.msg
 
+proc new(T: type RpcWebSocketServer, exposed: bool): T =
+  if exposed:
+    return T(router: RpcRouter.init(RouterKind.WebSocket))
+  T(router: RpcRouter.init())
+  
 proc initWebsocket(rpc: RpcWebSocketServer, compression: bool) =
   if compression:
     let deflateFactory = deflateFactory()
@@ -69,11 +78,12 @@ proc newRpcWebSocketServer*(
   address: TransportAddress,
   compression: bool = false,
   flags: set[ServerFlags] = {ServerFlags.TcpNoDelay,
-    ServerFlags.ReuseAddr}): RpcWebSocketServer =
+    ServerFlags.ReuseAddr},
+  exposed: bool = false): RpcWebSocketServer =
 
-  var server = new(RpcWebSocketServer)
+  var server = RpcWebSocketServer.new(exposed)
   proc processCallback(request: HttpRequest): Future[void] =
-    handleRequest(server, request)
+    handleRequest(server, request, exposed)
 
   server.initWebsocket(compression)
   server.server = HttpServer.create(
@@ -89,12 +99,14 @@ proc newRpcWebSocketServer*(
   port: Port,
   compression: bool = false,
   flags: set[ServerFlags] = {ServerFlags.TcpNoDelay,
-    ServerFlags.ReuseAddr}): RpcWebSocketServer =
+    ServerFlags.ReuseAddr},
+  exposed: bool = false): RpcWebSocketServer =
 
   newRpcWebSocketServer(
     initTAddress(host, port),
     compression,
-    flags
+    flags,
+    exposed
   )
 
 proc newRpcWebSocketServer*(
@@ -106,11 +118,12 @@ proc newRpcWebSocketServer*(
     ServerFlags.ReuseAddr},
   tlsFlags: set[TLSFlags] = {},
   tlsMinVersion = TLSVersion.TLS12,
-  tlsMaxVersion = TLSVersion.TLS12): RpcWebSocketServer =
+  tlsMaxVersion = TLSVersion.TLS12,
+  exposed: bool = false): RpcWebSocketServer =
 
-  var server = new(RpcWebSocketServer)
+  var server = RpcWebSocketServer.new(exposed)
   proc processCallback(request: HttpRequest): Future[void] =
-    handleRequest(server, request)
+    handleRequest(server, request, exposed)
 
   server.initWebsocket(compression)
   server.server = TlsHttpServer.create(
@@ -136,7 +149,8 @@ proc newRpcWebSocketServer*(
     ServerFlags.ReuseAddr},
   tlsFlags: set[TLSFlags] = {},
   tlsMinVersion = TLSVersion.TLS12,
-  tlsMaxVersion = TLSVersion.TLS12): RpcWebSocketServer =
+  tlsMaxVersion = TLSVersion.TLS12,
+  exposed: bool = false): RpcWebSocketServer =
 
   newRpcWebSocketServer(
     initTAddress(host, port),
@@ -146,7 +160,8 @@ proc newRpcWebSocketServer*(
     flags,
     tlsFlags,
     tlsMinVersion,
-    tlsMaxVersion
+    tlsMaxVersion,
+    exposed
   )
 
 proc start*(server: RpcWebSocketServer) =

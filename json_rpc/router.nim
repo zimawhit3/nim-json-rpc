@@ -1,19 +1,28 @@
 import
   std/[macros, options, strutils, tables],
-  chronicles, chronos, json_serialization/writer,
+  chronicles, chronos, json_serialization/writer, websock/websock,
   ./jsonmarshal, ./errors
 
 export
   chronos, jsonmarshal
 
 type
+  RouterKind* = enum
+    Default
+    WebSocket
+    
   StringOfJson* = JsonString
 
   # Procedure signature accepted as an RPC call by server
+  WsRpcProc* = proc(ws: WSSession, input: JsonNode): Future[StringOfJson] {.gcsafe, raises: [Defect].}
   RpcProc* = proc(input: JsonNode): Future[StringOfJson] {.gcsafe, raises: [Defect].}
 
   RpcRouter* = object
-    procs*: Table[string, RpcProc]
+    case kind*: RouterKind
+    of RouterKind.Default:
+      procs*: Table[string, RpcProc]
+    of RouterKind.WebSocket:
+      wsprocs*: Table[string, WsRpcProc]
 
 const
   methodField = "method"
@@ -28,18 +37,31 @@ const
 
   defaultMaxRequestLength* = 1024 * 128
 
-proc init*(T: type RpcRouter): T = discard
+proc init*(T: type RpcRouter, K: RouterKind = RouterKind.Default): T = 
+  T(kind: K)
 
 proc newRpcRouter*: RpcRouter {.deprecated.} =
   RpcRouter.init()
 
 proc register*(router: var RpcRouter, path: string, call: RpcProc) =
-  router.procs.add(path, call)
+  router.procs[path] = call
+
+proc register*(router: var RpcRouter, path: string, call: WsRpcProc) =
+  router.wsprocs[path] = call
 
 proc clear*(router: var RpcRouter) =
-  router.procs.clear
+  case router.kind
+  of Default:
+    router.procs.clear
+  of WebSocket:
+    router.wsprocs.clear
 
-proc hasMethod*(router: RpcRouter, methodName: string): bool = router.procs.hasKey(methodName)
+proc hasMethod*(router: RpcRouter, methodName: string): bool =
+  case router.kind
+  of Default:
+    router.procs.hasKey(methodName)
+  of WebSocket:
+    router.wsprocs.hasKey(methodName)
 
 func isEmpty(node: JsonNode): bool = node.isNil or node.kind == JNull
 
@@ -87,6 +109,47 @@ proc route*(router: RpcRouter, node: JsonNode): Future[StringOfJson] {.async, gc
       return wrapError(
         SERVER_ERROR, methodName & " raised an exception", id, newJString(err.msg))
 
+proc route*(router: RpcRouter, ws: WSSession, node: JsonNode): Future[StringOfJson] {.async, gcsafe.} =
+  if node{"jsonrpc"}.getStr() != "2.0":
+    return wrapError(INVALID_REQUEST, "'jsonrpc' missing or invalid")
+
+  let id = node{"id"}
+  if id == nil:
+    return wrapError(INVALID_REQUEST, "'id' missing or invalid")
+
+  let methodName = node{"method"}.getStr()
+  if methodName.len == 0:
+    return wrapError(INVALID_REQUEST, "'method' missing or invalid")
+
+  let rpcProc = router.wsprocs.getOrDefault(methodName)
+  let params = node.getOrDefault("params")
+
+  if rpcProc == nil:
+    return wrapError(METHOD_NOT_FOUND, "'" & methodName & "' is not a registered RPC method", id)
+  else:
+    try:
+      let res = await rpcProc(ws, if params == nil: newJArray() else: params)
+      return wrapReply(id, res)
+    except InvalidRequest as err:
+      return wrapError(err.code, err.msg, id)
+    except CatchableError as err:
+      debug "Error occurred within RPC", methodName = methodName, err = err.msg
+      return wrapError(
+        SERVER_ERROR, methodName & " raised an exception", id, newJString(err.msg))
+
+proc route*(router: RpcRouter, ws: WSSession, data: string): Future[string] {.async, gcsafe.} =
+  ## Route to RPC from string data. Data is expected to be able to be converted to Json.
+  ## Returns string of Json from RPC result/error node
+  let node =
+    try: parseJson(data)
+    except CatchableError as err:
+      return string(wrapError(JSON_PARSE_ERROR, err.msg))
+    except Exception as err:
+      # TODO https://github.com/status-im/nimbus-eth2/issues/2430
+      return string(wrapError(JSON_PARSE_ERROR, err.msg))
+
+  return string(await router.route(ws, node))
+
 proc route*(router: RpcRouter, data: string): Future[string] {.async, gcsafe.} =
   ## Route to RPC from string data. Data is expected to be able to be converted to Json.
   ## Returns string of Json from RPC result/error node
@@ -116,10 +179,21 @@ proc tryRoute*(router: RpcRouter, data: JsonNode, fut: var Future[StringOfJson])
     fut = rpc(jParams)
     return true
 
-proc makeProcName(s: string): string =
-  result = ""
-  for c in s:
-    if c.isAlphaNumeric: result.add c
+proc tryRoute*(router: RpcRouter, ws: WSSession, data: JsonNode, fut: var Future[StringOfJson]): bool =
+  ## Route to RPC, returns false if the method or params cannot be found.
+  ## Expects json input and returns json output.
+  let
+    jPath = data.getOrDefault(methodField)
+    jParams = data.getOrDefault(paramsField)
+  if jPath.isEmpty or jParams.isEmpty:
+    return false
+
+  let
+    path = jPath.getStr
+    rpc = router.wsprocs.getOrDefault(path)
+  if rpc != nil:
+    fut = rpc(ws, jParams)
+    return true
 
 proc hasReturnType(params: NimNode): bool =
   if params != nil and params.len > 0 and params[0] != nil and
@@ -169,6 +243,48 @@ macro rpc*(server: RpcRouter, path: string, body: untyped): untyped =
     result.add quote do:
       proc `rpcProcWrapper`(`paramsIdent`: JsonNode): Future[StringOfJson] {.async, gcsafe.} =
         return StringOfJson($(%(await `rpcProcImpl`(`paramsIdent`))))
+
+  result.add quote do:
+    `server`.register(`path`, `rpcProcWrapper`)
+
+  when defined(nimDumpRpcs):
+    echo "\n", pathStr, ": ", result.repr
+
+macro exposedRpc*(server: RpcRouter, path: string, body: untyped): untyped =
+  result = newStmtList()
+  let
+    parameters = body.findChild(it.kind == nnkFormalParams)
+    # all remote calls have a single parameter: `params: JsonNode`
+    paramsIdent = newIdentNode"params"
+    wsSessionIdent = newIdentNode"ws"
+    rpcProcImpl = genSym(nskProc)
+    rpcProcWrapper = genSym(nskProc)
+  var
+    setup = jsonToNim(parameters, paramsIdent)
+    procBody = if body.kind == nnkStmtList: body else: body.body
+
+  let ReturnType = if parameters.hasReturnType: parameters[0]
+                   else: ident "JsonNode"
+
+  # delegate async proc allows return and setting of result as native type
+  result.add quote do:
+    proc `rpcProcImpl`(`wsSessionIdent`: WSSession, `paramsIdent`: JsonNode): Future[`ReturnType`] {.async.} =
+      `setup`
+      `procBody`
+
+  if ReturnType == ident"JsonNode":
+    # `JsonNode` results don't need conversion
+    result.add quote do:
+      proc `rpcProcWrapper`(`wsSessionIdent`: WSSession, `paramsIdent`: JsonNode): Future[StringOfJson] {.async, gcsafe.} =
+        return StringOfJson($(await `rpcProcImpl`(`wsSessionIdent`, `paramsIdent`)))
+  elif ReturnType == ident"StringOfJson":
+    result.add quote do:
+      proc `rpcProcWrapper`(`wsSessionIdent`: WSSession, `paramsIdent`: JsonNode): Future[StringOfJson] {.async, gcsafe.} =
+        return await `rpcProcImpl`(`wsSessionIdent`, `paramsIdent`)
+  else:
+    result.add quote do:
+      proc `rpcProcWrapper`(`wsSessionIdent`: WSSession, `paramsIdent`: JsonNode): Future[StringOfJson] {.async, gcsafe.} =
+        return StringOfJson($(%(await `rpcProcImpl`(`wsSessionIdent`, `paramsIdent`))))
 
   result.add quote do:
     `server`.register(`path`, `rpcProcWrapper`)

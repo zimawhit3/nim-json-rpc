@@ -25,6 +25,3 @@ proc buildBinary(name: string, srcDir = "./", params = "", cmdParams = "") =
 task test, "run tests":
   buildBinary "all", "tests/",
     params = "-d:json_rpc_websocket_package=websock"
-
-  buildBinary "all", "tests/",
-    params = "-d:json_rpc_websocket_package=news"
